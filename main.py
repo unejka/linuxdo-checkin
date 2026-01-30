@@ -102,40 +102,80 @@ class LinuxDoBrowser:
         )
 
     def login(self):
-        logger.info("开始登录")
+        logger.info("开始登录流程")
+        
+        # --- 方案 A: 优先尝试 Cookie 登录 (推荐，可绕过 Cloudflare) ---
+        cookie_str = os.environ.get("LINUXDO_COOKIE")
+        if cookie_str:
+            logger.info("检测到 LINUXDO_COOKIE，尝试通过 Cookie 直接登录...")
+            
+            # 1. 设置 Requests Session 的 Cookie
+            # 简单的 Cookie 字符串解析
+            for item in cookie_str.split(';'):
+                if '=' in item:
+                    k, v = item.strip().split('=', 1)
+                    self.session.cookies.set(k, v, domain=".linux.do")
+            
+            # 2. 同步 Cookie 到 DrissionPage
+            # DrissionPage 需要 list[dict] 格式
+            dp_cookies = []
+            for name, value in self.session.cookies.items():
+                dp_cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": ".linux.do",
+                    "path": "/",
+                })
+            self.page.set.cookies(dp_cookies)
+            
+            # 3. 验证是否有效
+            logger.info("Cookie 设置完成，直接验证登录状态...")
+            self.page.get(HOME_URL)
+            time.sleep(3) # 等待页面加载
+            
+            if self._check_login_success():
+                return True
+            else:
+                logger.error("提供的 Cookie 无效或已过期，尝试回退到账号密码登录...")
+                # 如果 Cookie 失效，清理掉，防止干扰后续流程
+                self.session.cookies.clear()
+                self.page.delete_cookies()
+
+        # --- 方案 B: 账号密码登录 (在 GitHub Actions 上极大概率被 CF 拦截) ---
+        logger.info("尝试使用账号密码登录...")
+        
         # Step 1: Get CSRF Token
         logger.info("获取 CSRF token...")
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136", timeout=20)
-        ct = (resp_csrf.headers.get("content-type") or "").lower()
-        logger.info(f"CSRF status={resp_csrf.status_code}, url={resp_csrf.url}, content-type={ct}, len={len(resp_csrf.content)}")
-        logger.info(f"CSRF body head: {resp_csrf.text[:200]!r}")
         
-        if resp_csrf.status_code != 200:
-            raise RuntimeError(f"CSRF request failed: {resp_csrf.status_code}")
-        
-        if "application/json" not in ct:
-            raise RuntimeError(f"CSRF is not JSON, got content-type={ct}, body head={resp_csrf.text[:200]!r}")
-        
-        csrf_data = resp_csrf.json()
-        csrf_token = csrf_data.get("csrf")
-        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
+        try:
+            # 增加 timeout 防止卡死
+            resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome124", timeout=20)
+            
+            # 检查是否被 CF 拦截
+            if resp_csrf.status_code == 403 or "<title>Just a moment...</title>" in resp_csrf.text:
+                logger.error("❌ 严重错误: 请求被 Cloudflare 拦截 (403 Forbidden)。")
+                logger.error("💡 建议: GitHub Actions IP 信誉过低。请配置 'LINUXDO_COOKIE' 使用 Cookie 模式绕过登录接口。")
+                return False
 
-        # Step 2: Login
-        logger.info("正在登录...")
-        headers.update(
-            {
-                "X-CSRF-Token": csrf_token,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": "https://linux.do",
-            }
-        )
+            csrf_data = resp_csrf.json()
+            csrf_token = csrf_data.get("csrf")
+        except Exception as e:
+            logger.error(f"获取 CSRF 失败: {str(e)}")
+            return False
+
+        # Step 2: Login Post
+        logger.info(f"CSRF Token obtained. 正在提交登录表单...")
+        headers.update({
+            "X-CSRF-Token": csrf_token,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://linux.do",
+        })
 
         data = {
             "login": USERNAME,
@@ -146,70 +186,53 @@ class LinuxDoBrowser:
 
         try:
             resp_login = self.session.post(
-                SESSION_URL, data=data, impersonate="chrome136", headers=headers
+                SESSION_URL, data=data, impersonate="chrome124", headers=headers
             )
-
-            if resp_login.status_code == 200:
-                response_json = resp_login.json()
-                if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
-                    return False
-                logger.info("登录成功!")
-            else:
-                logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
+            
+            if resp_login.status_code != 200:
+                logger.error(f"登录 API 返回错误码: {resp_login.status_code}")
                 return False
+                
+            resp_json = resp_login.json()
+            if "error" in resp_json:
+                logger.error(f"登录失败: {resp_json['error']}")
+                return False
+                
+            logger.info("API 登录成功，同步 Cookie...")
+            
+            # 同步 Session Cookie 到 DrissionPage (原逻辑)
+            cookies_dict = self.session.cookies.get_dict()
+            dp_cookies = []
+            for name, value in cookies_dict.items():
+                dp_cookies.append({"name": name, "value": value, "domain": ".linux.do", "path": "/"})
+            self.page.set.cookies(dp_cookies)
+            
+            self.page.get(HOME_URL)
+            time.sleep(5)
+            return self._check_login_success()
+
         except Exception as e:
-            logger.error(f"登录请求异常: {e}")
+            logger.error(f"登录过程发生异常: {e}")
             return False
 
-        self.print_connect_info()  # 打印连接信息
-
-        # Step 3: Pass cookies to DrissionPage
-        logger.info("同步 Cookie 到 DrissionPage...")
-
-        # Convert requests cookies to DrissionPage format
-        # Using standard requests.utils to parse cookiejar if possible, or manual extraction
-        # requests.Session().cookies is a specialized object, but might support standard iteration
-
-        # We can iterate over the cookies manually if dict_from_cookiejar doesn't work perfectly
-        # or convert to dict first.
-        # Assuming requests behaves like requests:
-
-        cookies_dict = self.session.cookies.get_dict()
-
-        dp_cookies = []
-        for name, value in cookies_dict.items():
-            dp_cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": ".linux.do",
-                    "path": "/",
-                }
-            )
-
-        self.page.set.cookies(dp_cookies)
-
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-
-        time.sleep(5)
+    def _check_login_success(self):
+        """辅助方法：检查页面元素判断是否登录成功"""
         try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
-            return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
+            # 检查头像或特定用户元素
+            if self.page.ele("@id=current-user", timeout=2):
+                logger.success("✅ 登录验证成功 (发现 current-user)")
                 return True
-            logger.error("登录验证失败 (未找到 current-user)")
+            if "avatar" in self.page.html:
+                logger.success("✅ 登录验证成功 (发现 avatar)")
+                return True
+            
+            logger.warning("⚠️ 登录验证失败 (未找到用户标识)")
+            # 截图调试 (GitHub Actions 可在 Artifacts 查看，如果你配置了上传)
+            # self.page.get_screenshot(path="debug_login.png") 
             return False
-        else:
-            logger.info("登录验证成功")
-            return True
+        except Exception as e:
+            logger.warning(f"验证过程异常: {e}")
+            return False
 
     def click_topic(self):
         topic_list = self.page.ele("@id=list-area").eles(".:title")
