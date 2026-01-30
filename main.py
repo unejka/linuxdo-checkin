@@ -112,7 +112,17 @@ class LinuxDoBrowser:
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
+        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136", timeout=20)
+        ct = (resp_csrf.headers.get("content-type") or "").lower()
+        logger.info(f"CSRF status={resp_csrf.status_code}, url={resp_csrf.url}, content-type={ct}, len={len(resp_csrf.content)}")
+        logger.info(f"CSRF body head: {resp_csrf.text[:200]!r}")
+        
+        if resp_csrf.status_code != 200:
+            raise RuntimeError(f"CSRF request failed: {resp_csrf.status_code}")
+        
+        if "application/json" not in ct:
+            raise RuntimeError(f"CSRF is not JSON, got content-type={ct}, body head={resp_csrf.text[:200]!r}")
+        
         csrf_data = resp_csrf.json()
         csrf_token = csrf_data.get("csrf")
         logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
